@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Videojuego de Calabaza - Cámara Dual</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; }
+        canvas { display: block; }
+        #info { position: absolute; top: 10px; width: 100%; text-align: center; color: white; font-family: Arial, sans-serif; font-size: 16px; z-index: 100; }
+    </style>
+</head>
+<body>
+
+    <div id="info">
+        Controles: [W, A, S, D] para Mover | [Barra Espaciadora] para Saltar | [Clic Izquierdo] para Soplar | [C] para Cambiar Cámara
+    </div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+        // Volvemos a importar OrbitControls
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+        // --- CONFIGURACIÓN BÁSICA ---
+        const scene = new THREE.Scene();
+        const nightColor = 0x0a0a2a;
+        scene.background = new THREE.Color(nightColor);
+        scene.fog = new THREE.Fog(nightColor, 1, 50);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 2, 5);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        // --- NUEVO: CONFIGURACIÓN DE CÁMARA DUAL ---
+        let isOrbitCameraActive = false;
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enabled = false; // Inicia deshabilitada
+        controls.enableDamping = true; // Suaviza el movimiento de la cámara orbital
+
+        // --- LUCES ---
+        const hemisphereLight = new THREE.HemisphereLight(0x446699, 0x112233, 0.5);
+        scene.add(hemisphereLight);
+        
+        const ambientLight = new THREE.AmbientLight(0x404040, 0.1);
+        scene.add(ambientLight);
+
+        const moonLight = new THREE.DirectionalLight(0xaaccff, 1.0);
+        moonLight.position.set(10, 15, -10);
+        moonLight.castShadow = true;
+        moonLight.shadow.mapSize.width = 2048;
+        moonLight.shadow.mapSize.height = 2048;
+        moonLight.shadow.bias = -0.0001;
+        scene.add(moonLight);
+
+        // --- SUELO DE CÉSPED (BASE) ---
+        const groundGeometry = new THREE.PlaneGeometry(100, 100);
+        const groundMaterial = new THREE.MeshStandardMaterial({ color: 0x1a4a1a });
+        const ground = new THREE.Mesh(groundGeometry, groundMaterial);
+        ground.rotation.x = -Math.PI / 2;
+        ground.receiveShadow = true;
+        scene.add(ground);
+
+        // --- DISEÑO DEL CAMINO ---
+        const pathShape = new THREE.Shape();
+        const pathWidth = 4;
+        const hw = pathWidth / 2;
+        pathShape.moveTo(-hw, 25);
+        pathShape.lineTo(hw, 25);
+        pathShape.lineTo(hw, -20);
+        pathShape.lineTo(30, -20);
+        pathShape.lineTo(30, -15);
+        pathShape.lineTo(45, -15);
+        pathShape.lineTo(45, -25);
+        pathShape.lineTo(20, -25);
+        pathShape.lineTo(20, -30);
+        pathShape.lineTo(45, -30);
+        pathShape.lineTo(45, -40);
+        pathShape.lineTo(-hw, -40);
+        pathShape.lineTo(-hw, 25);
+        const pathGeometry = new THREE.ShapeGeometry(pathShape);
+        const pathMaterial = new THREE.MeshStandardMaterial({ color: 0x5c4033 });
+        const pathMesh = new THREE.Mesh(pathGeometry, pathMaterial);
+        pathMesh.rotation.x = -Math.PI / 2;
+        pathMesh.position.y = 0.01;
+        pathMesh.receiveShadow = true;
+        scene.add(pathMesh);
+
+        // --- VARIABLES DEL PERSONAJE ---
+        let model, mixer;
+        const animationActions = {};
+        let activeAction;
+        const clock = new THREE.Clock();
+        const characterSpeed = 2.5;
+        const rotationSpeed = 3.0;
+        const keysPressed = {};
+        
+        const loader = new GLTFLoader();
+        loader.load(
+            '3DModels/Calabaza1.glb',
+            (gltf) => {
+                model = gltf.scene;
+                model.position.set(0, 0, 22);
+                model.rotation.y = Math.PI;
+                model.traverse((node) => { if (node.isMesh) { node.castShadow = true; } });
+                scene.add(model);
+
+                mixer = new THREE.AnimationMixer(model);
+                const animationNames = ['Idle', 'Walk', 'Blow', 'Jump'];
+                animationNames.forEach(name => {
+                    const clip = THREE.AnimationClip.findByName(gltf.animations, name);
+                    if (clip) {
+                        const action = mixer.clipAction(clip);
+                        animationActions[name] = action;
+                        if (name === 'Blow' || name === 'Jump') {
+                            action.setLoop(THREE.LoopOnce);
+                            action.clampWhenFinished = true;
+                        }
+                    }
+                });
+                if (animationActions.Idle) setActiveAction(animationActions.Idle);
+                mixer.addEventListener('finished', (e) => {
+                    if (e.action === animationActions.Blow || e.action === animationActions.Jump) {
+                        transitionToAction(animationActions.Idle);
+                    }
+                });
+            },
+            undefined,
+            (error) => console.error('Error al cargar el modelo de calabaza:', error)
+        );
+
+        // --- LÓGICA DE ÁRBOLES ---
+        const pathCenterline = [
+            new THREE.Vector2(0, 22), new THREE.Vector2(0, -22), new THREE.Vector2(28, -22),
+            new THREE.Vector2(28, -17), new THREE.Vector2(43, -17), new THREE.Vector2(43, -27),
+            new THREE.Vector2(22, -27), new THREE.Vector2(22, -32), new THREE.Vector2(43, -32),
+            new THREE.Vector2(43, -38), new THREE.Vector2(0, -38)
+        ];
+
+        const treeLoader = new GLTFLoader();
+        // Cambiado a Arbol.glb según tu último código
+        treeLoader.load('3DModels/Arbol2.glb', (gltf) => {
+            const treeModel = gltf.scene;
+            treeModel.traverse((node) => { if (node.isMesh) { node.castShadow = true; } });
+
+            // Mismos parámetros que tu archivo, pero se ajustará la distancia
+            const numberOfTrees = 100;
+            const minScale = 4.0, maxScale = 7.0;
+
+            for (let i = 0; i < numberOfTrees; i++) {
+                const clonedTree = treeModel.clone();
+                const segmentIndex = Math.floor(Math.random() * (pathCenterline.length - 1));
+                const p1 = pathCenterline[segmentIndex];
+                const p2 = pathCenterline[segmentIndex + 1];
+                const pointOnPath = new THREE.Vector2().lerpVectors(p1, p2, Math.random());
+                const direction = new THREE.Vector2().subVectors(p2, p1).normalize();
+                const perpendicular = new THREE.Vector2(-direction.y, direction.x);
+                const side = Math.random() < 0.5 ? -1 : 1;
+                
+                // --- AJUSTE CLAVE: ÁRBOLES MÁS CERCANOS ---
+                // Se reduce la distancia al camino para un bosque más denso.
+                const offsetDistance = (pathWidth / 2) + 0.5 + (Math.random() * 2.5);
+                
+                const finalPosition = pointOnPath.add(perpendicular.multiplyScalar(offsetDistance * side));
+                clonedTree.position.set(finalPosition.x, 0, finalPosition.y);
+                const scale = Math.random() * (maxScale - minScale) + minScale;
+                clonedTree.scale.set(scale, scale, scale);
+                clonedTree.rotation.y = Math.random() * Math.PI * 2;
+                scene.add(clonedTree);
+            }
+        }, undefined, (error) => console.error('Error al cargar el modelo de árbol:', error));
+
+        // --- FUNCIONES DE ANIMACIÓN ---
+        function setActiveAction(action) {
+            if (activeAction) activeAction.stop();
+            activeAction = action;
+            activeAction.reset().play();
+        }
+        function transitionToAction(action, duration = 0.2) {
+            if (activeAction === action || !action) return;
+            const previousAction = activeAction;
+            activeAction = action;
+            if (previousAction) previousAction.fadeOut(duration);
+            activeAction.reset().setEffectiveTimeScale(1).setEffectiveWeight(1).fadeIn(duration).play();
+        }
+
+        // --- CONTROLES Y MOVIMIENTO ---
+        document.addEventListener('keydown', (e) => {
+            const key = e.key.toLowerCase();
+            keysPressed[key] = true;
+            if (e.code === 'Space') {
+                e.preventDefault();
+                if (animationActions.Jump && activeAction !== animationActions.Jump) transitionToAction(animationActions.Jump);
+            }
+            // --- NUEVO: INTERRUPTOR DE CÁMARA ---
+            if (key === 'c') {
+                isOrbitCameraActive = !isOrbitCameraActive;
+                controls.enabled = isOrbitCameraActive;
+                // Si activamos la cámara orbital, la centramos en el personaje
+                if (isOrbitCameraActive && model) {
+                    controls.target.copy(model.position).add(new THREE.Vector3(0, 1.0, 0));
+                }
+            }
+        });
+        document.addEventListener('keyup', (e) => { keysPressed[e.key.toLowerCase()] = false; });
+        window.addEventListener('mousedown', (e) => { if (e.button === 0 && animationActions.Blow && activeAction !== animationActions.Blow) transitionToAction(animationActions.Blow); });
+
+        function updateCharacter(deltaTime) {
+            if (!model) return;
+            let isMoving = false;
+            if (keysPressed['w'] || keysPressed['s']) isMoving = true;
+            if (keysPressed['a']) model.rotation.y += rotationSpeed * deltaTime;
+            if (keysPressed['d']) model.rotation.y -= rotationSpeed * deltaTime;
+            if (isMoving) {
+                const moveDirection = keysPressed['w'] ? 1 : -1;
+                const moveVector = new THREE.Vector3(0, 0, moveDirection);
+                moveVector.applyQuaternion(model.quaternion);
+                model.position.add(moveVector.multiplyScalar(characterSpeed * deltaTime));
+                if (activeAction !== animationActions.Walk && activeAction !== animationActions.Jump && activeAction !== animationActions.Blow) transitionToAction(animationActions.Walk);
+            } else if (activeAction === animationActions.Walk) {
+                transitionToAction(animationActions.Idle);
+            }
+        }
+
+        // --- CÁMARA DE SEGUIMIENTO (MODO "REBOTE") ---
+        function updateFollowCamera() {
+            if (!model) return;
+            const cameraOffset = new THREE.Vector3(0, 2.5, -5.0);
+            cameraOffset.applyQuaternion(model.quaternion);
+            const targetPosition = model.position.clone().add(cameraOffset);
+            camera.position.lerp(targetPosition, 0.05);
+            const lookAtTarget = model.position.clone().add(new THREE.Vector3(0, 1.0, 0));
+            camera.lookAt(lookAtTarget);
+        }
+
+        // --- BUCLE DE ANIMACIÓN ---
+        function animate() {
+            requestAnimationFrame(animate);
+            const deltaTime = clock.getDelta();
+            if (mixer) mixer.update(deltaTime);
+            updateCharacter(deltaTime);
+            
+            // --- NUEVO: LÓGICA PARA ALTERNAR CÁMARAS ---
+            if (isOrbitCameraActive) {
+                controls.update(); // Actualiza la cámara orbital
+            } else {
+                updateFollowCamera(); // Actualiza la cámara de seguimiento
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
